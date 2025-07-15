@@ -166,6 +166,22 @@ class Attention(nn.Module):
         output = self.wo(output)
         output = self.resid_dropout(output)
         return output
+    
+class MLP(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = dim * 4
+            hidden_dim = int(2 * hidden_dim / 3)   
+            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 def test_attention():
     args = ModelConfig()
@@ -177,4 +193,12 @@ def test_attention():
     freqs_cos, freqs_sin = precompute_freqs_cis(dim//args.n_heads, seq_len)
     output = attention_model(x, freqs_cos, freqs_sin)
     print("Output shape:", output.shape)
+    
+def test_mlp():
+    args = ModelConfig()
+    mlp = MLP(args.dim, args.hidden_dim, args.multiple_of, args.dropout)
+    x = torch.randn(1, 50, args.dim)
+    output = mlp(x)
+    print(output.shape)
+
 
