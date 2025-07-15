@@ -2,6 +2,7 @@ import math
 import inspect
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
+from sympy import O
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -41,9 +42,9 @@ class ModelConfig(PretrainedConfig):
         self.flash_attn = flash_attn
         super().__init__(**kwargs)
 
-Class RMSNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float):
-        super.__init__()
+        super().__init__()
         # 防止除0
         self.eps = eps
         # 可训练参数weight，初始化为[1....1]
@@ -58,7 +59,7 @@ Class RMSNorm(nn.Module):
 def repeat_kv_(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, seq_len, n_kv_heads, head_dim = x.shape
 
-    if n_rep = 1:
+    if n_rep == 1:
         return x
 
     return x[:, :, :, None, :].expand(bs, seq_len, n_kv_heads, n_rep, head_dim).reshape(bs, seq_len, n_kv_heads * n_rep, head_dim) 
@@ -103,4 +104,77 @@ def apply_rotary_emb(
     xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+def repeat_kv(x: torch.Tensor, n_rep: int):
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    
+    return(
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, args: ModelConfig):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        assert args.n_heads % self.n_kv_heads == 0
+
+        model_parallel_size = 1
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads =  args.n_kv_heads // model_parallel_size
+        self.n_rep = args.n_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.head_dim
+
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias = False)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias = False)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias = False)
+
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias = False)
+        
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = nn.Dropout(args.dropout)
+
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)
+            self.register_buffer("mask", mask)
+
+    def forward(self, x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor):
+        bsz, seqlen, _ = x.shape           
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+
+        xk = repeat_kv(xk, self.n_rep)
+        xv = repeat_kv(xv, self.n_rep)
+
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        if self.flash:
+            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+            assert hasattr(self, 'mask')
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = torch.matmul(scores, xv)
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
+            output = self.wo(output)
+            output = self.resid_dropout(output)
+
+            return output
 
