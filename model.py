@@ -56,7 +56,7 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return self._norm(x.float()).type_as(x) * self.weight
 
-def repeat_kv_(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, seq_len, n_kv_heads, head_dim = x.shape
 
     if n_rep == 1:
@@ -105,17 +105,6 @@ def apply_rotary_emb(
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-def repeat_kv(x: torch.Tensor, n_rep: int):
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    
-    return(
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
-
 class Attention(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -126,7 +115,7 @@ class Attention(nn.Module):
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads =  args.n_kv_heads // model_parallel_size
         self.n_rep = args.n_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.head_dim
+        self.head_dim = args.dim // args.n_heads
 
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias = False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias = False)
@@ -136,7 +125,7 @@ class Attention(nn.Module):
         
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        self.dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
 
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -171,10 +160,21 @@ class Attention(nn.Module):
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)
-            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+            
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
-            output = self.wo(output)
-            output = self.resid_dropout(output)
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
 
-            return output
+def test_attention():
+    args = ModelConfig()
+    attention_model = Attention(args)
+    batch_size = 1
+    seq_len = 50
+    dim = args.dim 
+    x = torch.rand(batch_size, seq_len, dim)
+    freqs_cos, freqs_sin = precompute_freqs_cis(dim//args.n_heads, seq_len)
+    output = attention_model(x, freqs_cos, freqs_sin)
+    print("Output shape:", output.shape)
 
